@@ -48,3 +48,23 @@ Thumbs.db
 *.mov
 *.wmv
 
+
+# QA Manager local files
+.env
+node_modules/
+dist/
+__pycache__/
+*.pyc
+*.db
+.pytest_cache/
+uploads/
+backups/
+
+.venv/
+*.tsbuildinfo
+.playwright-mcp/
+.agents/
+.aws/
+.codex/
+.env.*
+!.env.example
