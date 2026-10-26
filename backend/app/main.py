@@ -9,86 +9,21 @@ from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, Column, Integer, String, Text, ForeignKey, DateTime, Boolean, JSON, select, func, UniqueConstraint, Index, inspect, text
-from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import sessionmaker, Session
 import jwt
+from .models import Base, now, User, Project, Membership, TestFolder, TestCase, CaseVersion, TestPlan, PlanCase, Cycle, CycleCase, Execution, Defect, DefectExecution, AutomationMap, ImportLog, Attachment, AuditEvent, ApiToken, Notification, RequirementRecord, RequirementCase, CustomField
+from .dashboard import create_dashboard_router
+from .test_cases import create_test_cases_router
 
 DATABASE_URL=os.getenv('DATABASE_URL','sqlite:///./dev.db')
 SECRET=os.getenv('JWT_SECRET','development-only-change-me')
 engine=create_engine(DATABASE_URL, pool_pre_ping=True, connect_args={'check_same_thread':False} if DATABASE_URL.startswith('sqlite') else {})
 SessionLocal=sessionmaker(bind=engine)
-Base=declarative_base()
 UPLOAD_DIR=os.getenv('UPLOAD_DIR',os.path.join(os.path.dirname(__file__),'uploads'))
 MAX_UPLOAD_BYTES=int(os.getenv('MAX_UPLOAD_BYTES','10485760'))
 SESSION_HOURS=int(os.getenv('SESSION_HOURS','8'))
 COOKIE_SECURE=os.getenv('COOKIE_SECURE','false').lower()=='true'
-def now(): return datetime.now(timezone.utc)
-class User(Base):
-    __tablename__='users'
-    id=Column(Integer,primary_key=True); email=Column(String(255),unique=True,nullable=False); name=Column(String(120),nullable=False); password_hash=Column(String(300),nullable=False); role=Column(String(20),default='tester'); roles=Column(JSON,nullable=False,default=list); active=Column(Boolean,default=True)
-class Project(Base):
-    __tablename__='projects'
-    id=Column(Integer,primary_key=True); key=Column(String(40),unique=True); name=Column(String(180),nullable=False); description=Column(Text,default=''); archived=Column(Boolean,default=False,nullable=False); created_at=Column(DateTime(timezone=True),default=now)
-class Membership(Base):
-    __tablename__='memberships'; __table_args__=(UniqueConstraint('project_id','user_id'),)
-    id=Column(Integer,primary_key=True); project_id=Column(Integer,ForeignKey('projects.id'),nullable=False); user_id=Column(Integer,ForeignKey('users.id'),nullable=False); role=Column(String(20),default='tester',nullable=False)
-class TestFolder(Base):
-    __tablename__='test_folders'; __table_args__=(UniqueConstraint('project_id','name'),)
-    id=Column(Integer,primary_key=True); project_id=Column(Integer,ForeignKey('projects.id'),nullable=False); parent_id=Column(Integer,ForeignKey('test_folders.id'),nullable=True); name=Column(String(180),nullable=False)
-class TestCase(Base):
-    __tablename__='test_cases'
-    id=Column(Integer,primary_key=True); project_id=Column(Integer,ForeignKey('projects.id'),nullable=False); folder_id=Column(Integer,ForeignKey('test_folders.id'),nullable=True); title=Column(String(300),nullable=False); priority=Column(String(20),default='Medium'); kind=Column(String(20),default='Manual'); status=Column(String(30),default='Active'); version=Column(Integer,default=1); archived=Column(Boolean,default=False); author_id=Column(Integer,ForeignKey('users.id'),nullable=True); created_at=Column(DateTime(timezone=True),default=now); updated_at=Column(DateTime(timezone=True),default=now,onupdate=now); custom_values=Column(JSON,default=dict)
-class CaseVersion(Base):
-    __tablename__='case_versions'; __table_args__=(UniqueConstraint('case_id','version'),)
-    id=Column(Integer,primary_key=True); case_id=Column(Integer,ForeignKey('test_cases.id'),nullable=False); version=Column(Integer,nullable=False); preconditions=Column(Text,default=''); steps=Column(JSON,default=list); author_id=Column(Integer,ForeignKey('users.id'),nullable=True); created_at=Column(DateTime(timezone=True),default=now)
-class TestPlan(Base):
-    __tablename__='test_plans'
-    id=Column(Integer,primary_key=True); project_id=Column(Integer,ForeignKey('projects.id'),nullable=False); name=Column(String(200),nullable=False); release=Column(String(100),default=''); scope=Column(Text,default=''); owner_id=Column(Integer,ForeignKey('users.id'),nullable=True); archived=Column(Boolean,default=False)
-class PlanCase(Base):
-    __tablename__='plan_cases'; __table_args__=(UniqueConstraint('plan_id','case_id'),)
-    id=Column(Integer,primary_key=True); plan_id=Column(Integer,ForeignKey('test_plans.id'),nullable=False); case_id=Column(Integer,ForeignKey('test_cases.id'),nullable=False)
-class Cycle(Base):
-    __tablename__='cycles'
-    id=Column(Integer,primary_key=True); plan_id=Column(Integer,ForeignKey('test_plans.id'),nullable=False); name=Column(String(200),nullable=False); environment=Column(String(100),default='QA'); start_date=Column(DateTime(timezone=True),nullable=True); end_date=Column(DateTime(timezone=True),nullable=True)
-class CycleCase(Base):
-    __tablename__='cycle_cases'; __table_args__=(UniqueConstraint('cycle_id','case_id'),)
-    id=Column(Integer,primary_key=True); cycle_id=Column(Integer,ForeignKey('cycles.id'),nullable=False); case_id=Column(Integer,ForeignKey('test_cases.id'),nullable=False); version_id=Column(Integer,ForeignKey('case_versions.id'),nullable=False); assigned_to=Column(Integer,ForeignKey('users.id'),nullable=True)
-class Execution(Base):
-    __tablename__='executions'
-    id=Column(Integer,primary_key=True); cycle_case_id=Column(Integer,ForeignKey('cycle_cases.id'),nullable=False); user_id=Column(Integer,ForeignKey('users.id'),nullable=True); status=Column(String(20),nullable=False); source=Column(String(20),default='Manual'); notes=Column(Text,default=''); actual_result=Column(Text,default=''); step_results=Column(JSON,default=list); duration=Column(String(30),default=''); created_at=Column(DateTime(timezone=True),default=now)
-class Defect(Base):
-    __tablename__='defects'
-    id=Column(Integer,primary_key=True); project_id=Column(Integer,ForeignKey('projects.id'),nullable=False); title=Column(String(300),nullable=False); description=Column(Text,default=''); severity=Column(String(20),default='Medium'); priority=Column(String(20),default='Medium'); status=Column(String(30),default='New'); assigned_to=Column(Integer,ForeignKey('users.id'),nullable=True); execution_id=Column(Integer,ForeignKey('executions.id'),nullable=True); created_at=Column(DateTime(timezone=True),default=now); updated_at=Column(DateTime(timezone=True),default=now,onupdate=now)
-class DefectExecution(Base):
-    __tablename__='defect_executions'; __table_args__=(UniqueConstraint('defect_id','execution_id'),)
-    id=Column(Integer,primary_key=True); defect_id=Column(Integer,ForeignKey('defects.id'),nullable=False); execution_id=Column(Integer,ForeignKey('executions.id'),nullable=False)
-class AutomationMap(Base):
-    __tablename__='automation_maps'; __table_args__=(UniqueConstraint('project_id','external_id'),)
-    id=Column(Integer,primary_key=True); project_id=Column(Integer,ForeignKey('projects.id'),nullable=False); external_id=Column(String(400),nullable=False); case_id=Column(Integer,ForeignKey('test_cases.id'),nullable=False)
-class ImportLog(Base):
-    __tablename__='import_logs'; __table_args__=(UniqueConstraint('cycle_id','checksum'),)
-    id=Column(Integer,primary_key=True); cycle_id=Column(Integer,ForeignKey('cycles.id'),nullable=False); filename=Column(String(255)); checksum=Column(String(64),nullable=True); imported=Column(Integer,default=0); unmatched=Column(JSON,default=list); errors=Column(JSON,default=list); created_at=Column(DateTime(timezone=True),default=now)
-class Attachment(Base):
-    __tablename__='attachments'
-    id=Column(Integer,primary_key=True); project_id=Column(Integer,ForeignKey('projects.id'),nullable=False); execution_id=Column(Integer,ForeignKey('executions.id'),nullable=True); filename=Column(String(255),nullable=False); content_type=Column(String(100),nullable=False); size=Column(Integer,nullable=False); storage_key=Column(String(80),unique=True,nullable=False); uploaded_by=Column(Integer,ForeignKey('users.id'),nullable=False); created_at=Column(DateTime(timezone=True),default=now)
-class AuditEvent(Base):
-    __tablename__='audit_events'; __table_args__=(Index('ix_audit_project_created','project_id','created_at'),)
-    id=Column(Integer,primary_key=True); project_id=Column(Integer,ForeignKey('projects.id'),nullable=True); actor_id=Column(Integer,ForeignKey('users.id'),nullable=True); action=Column(String(80),nullable=False); entity_type=Column(String(80),nullable=False); entity_id=Column(String(80),nullable=False); before=Column(JSON,nullable=True); after=Column(JSON,nullable=True); created_at=Column(DateTime(timezone=True),default=now)
-class ApiToken(Base):
-    __tablename__='api_tokens'
-    id=Column(Integer,primary_key=True); name=Column(String(120),nullable=False); token_hash=Column(String(64),unique=True,nullable=False); prefix=Column(String(12),nullable=False); user_id=Column(Integer,ForeignKey('users.id'),nullable=False); project_id=Column(Integer,ForeignKey('projects.id'),nullable=False); expires_at=Column(DateTime(timezone=True),nullable=True); revoked=Column(Boolean,default=False); created_at=Column(DateTime(timezone=True),default=now)
-class Notification(Base):
-    __tablename__='notifications'; __table_args__=(Index('ix_notifications_user_created','user_id','created_at'),)
-    id=Column(Integer,primary_key=True); user_id=Column(Integer,ForeignKey('users.id'),nullable=False); title=Column(String(200),nullable=False); message=Column(Text,nullable=False); link=Column(String(300),default=''); read=Column(Boolean,default=False); created_at=Column(DateTime(timezone=True),default=now)
-class RequirementRecord(Base):
-    __tablename__='requirements'; __table_args__=(UniqueConstraint('project_id','key'),)
-    id=Column(Integer,primary_key=True); project_id=Column(Integer,ForeignKey('projects.id'),nullable=False); key=Column(String(80),nullable=False); title=Column(String(300),nullable=False); description=Column(Text,default=''); status=Column(String(30),default='Active'); created_at=Column(DateTime(timezone=True),default=now)
-class RequirementCase(Base):
-    __tablename__='requirement_cases'; __table_args__=(UniqueConstraint('requirement_id','case_id'),)
-    id=Column(Integer,primary_key=True); requirement_id=Column(Integer,ForeignKey('requirements.id'),nullable=False); case_id=Column(Integer,ForeignKey('test_cases.id'),nullable=False)
-class CustomField(Base):
-    __tablename__='custom_fields'; __table_args__=(UniqueConstraint('project_id','name'),)
-    id=Column(Integer,primary_key=True); project_id=Column(Integer,ForeignKey('projects.id'),nullable=False); name=Column(String(100),nullable=False); field_type=Column(String(20),nullable=False); required=Column(Boolean,default=False); options=Column(JSON,default=list)
-
 def password_hash(password):
     salt=secrets.token_hex(16); digest=hashlib.pbkdf2_hmac('sha256',password.encode(),bytes.fromhex(salt),260000).hex(); return salt+':'+digest
 def verify_password(password, stored):
@@ -130,7 +65,7 @@ def ensure_database_schema(bind=None):
         'users': {'roles':"JSON NOT NULL DEFAULT '[]'"},
         'projects': {'key':"VARCHAR(40)",'archived':"BOOLEAN NOT NULL DEFAULT FALSE"},
         'memberships': {'role':"VARCHAR(20) NOT NULL DEFAULT 'tester'"},
-        'test_cases': {'folder_id':"INTEGER",'status':"VARCHAR(30) NOT NULL DEFAULT 'Active'",'author_id':"INTEGER",'created_at':"DATETIME",'updated_at':"DATETIME",'custom_values':"JSON NOT NULL DEFAULT '{}'"},
+        'test_cases': {'import_metadata':"JSON NOT NULL DEFAULT '{}'",'folder_id':"INTEGER",'status':"VARCHAR(30) NOT NULL DEFAULT 'Active'",'author_id':"INTEGER",'created_at':"DATETIME",'updated_at':"DATETIME",'custom_values':"JSON NOT NULL DEFAULT '{}'"},
         'case_versions': {'author_id':"INTEGER"},
         'test_plans': {'release':"VARCHAR(100) NOT NULL DEFAULT ''",'scope':"TEXT NOT NULL DEFAULT ''",'owner_id':"INTEGER",'archived':"BOOLEAN NOT NULL DEFAULT FALSE"},
         'cycles': {'start_date':"DATETIME",'end_date':"DATETIME"},
@@ -256,7 +191,6 @@ class Login(BaseModel): email:str; password:str
 class UserIn(BaseModel): email:str; name:str; password:str=Field(min_length=12); role:Optional[str]=None; roles:Optional[list[str]]=None
 class UserUpdate(BaseModel): roles:Optional[list[str]]=None; active:Optional[bool]=None
 class ProjectIn(BaseModel): key:str; name:str; description:str=''
-class CaseIn(BaseModel): project_id:int; title:str; priority:str='Medium'; kind:str='Manual'; status:str='Active'; preconditions:str=''; steps:list[dict]=Field(default_factory=list); folder_id:Optional[int]=None; custom_values:dict=Field(default_factory=dict)
 class PlanIn(BaseModel): project_id:int; name:str; release:str=''; scope:str=''; owner_id:Optional[int]=None; case_ids:list[int]=Field(default_factory=list)
 class CycleIn(BaseModel): plan_id:int; name:str; environment:str='QA'; start_date:Optional[datetime]=None; end_date:Optional[datetime]=None
 class AssignIn(BaseModel): case_id:int; assigned_to:Optional[int]=None; version_id:Optional[int]=None
@@ -265,6 +199,31 @@ class DefectIn(BaseModel): project_id:int; title:str; description:str=''; severi
 class MapIn(BaseModel): project_id:int; external_id:str; case_id:int
 class MembershipIn(BaseModel): user_id:int; role:str='tester'
 class RequirementIn(BaseModel): project_id:int; key:str; title:str; description:str=''; status:str='Active'
+class RegisterIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=12, max_length=256)
+
+@app.post('/api/auth/register', status_code=201)
+def register(body:RegisterIn, s:Session=Depends(db)):
+    name=body.name.strip()
+    email=body.email.strip().lower()
+    if not name: raise HTTPException(400,'Name is required')
+    if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email):
+        raise HTTPException(400,'Enter a valid email address')
+    if s.scalar(select(User).where(User.email==email)):
+        raise HTTPException(409,'Email already exists')
+    account=User(name=name,email=email,password_hash=password_hash(body.password),role='tester',roles=['tester'],active=True)
+    try:
+        s.add(account)
+        s.flush()
+        audit(s,account.id,'register','user',account.id,after={'email':email,'roles':['tester']})
+        s.commit()
+    except IntegrityError:
+        s.rollback()
+        raise HTTPException(409,'Email already exists')
+    return {'id':account.id,'name':account.name,'email':account.email}
+
 @app.post('/api/auth/login')
 def login(body:Login,response:Response,s:Session=Depends(db)):
     u=s.scalar(select(User).where(User.email==body.email.lower()))
@@ -353,65 +312,6 @@ def available_project_users(id:int,s:Session=Depends(db),u:User=Depends(user)):
     accessible(s,u,id);require_project_role(s,u,id,('admin','lead'))
     assigned=select(Membership.user_id).where(Membership.project_id==id)
     return [{'id':x.id,'name':x.name,'email':x.email,'role':legacy_primary_role(user_roles(x)),'roles':user_roles(x),'active':x.active} for x in s.scalars(select(User).where(User.active==True,User.id.not_in(assigned))).all()]
-@app.get('/api/cases')
-def cases(project_id:int,q:str='',priority:Optional[str]=None,kind:Optional[str]=None,folder_id:Optional[int]=None,include_archived:bool=False,offset:int=Query(0,ge=0),limit:int=Query(100,ge=1,le=500),s:Session=Depends(db),u:User=Depends(user)):
-    accessible(s,u,project_id);query=select(TestCase).where(TestCase.project_id==project_id)
-    if not include_archived: query=query.where(TestCase.archived==False)
-    if q: query=query.where(TestCase.title.ilike(f'%{q}%'))
-    if priority: query=query.where(TestCase.priority==priority)
-    if kind: query=query.where(TestCase.kind==kind)
-    if folder_id is not None: query=query.where(TestCase.folder_id==folder_id)
-    return [data(x) for x in s.scalars(query.order_by(TestCase.id.desc()).offset(offset).limit(limit)).all()]
-@app.get('/api/cases/{id}')
-def case(id:int,version:Optional[int]=None,s:Session=Depends(db),u:User=Depends(user)):
-    x=obj(s,TestCase,id);accessible(s,u,x.project_id);v=s.scalar(select(CaseVersion).where(CaseVersion.case_id==id,CaseVersion.version==version if version else x.version))
-    if not v: raise HTTPException(404,'Test case version not found')
-    return data(x)|{'preconditions':v.preconditions,'steps':v.steps,'version_number':v.version}
-@app.get('/api/cases/{id}/versions')
-def case_versions(id:int,s:Session=Depends(db),u:User=Depends(user)):
-    x=obj(s,TestCase,id);accessible(s,u,x.project_id)
-    return [data(v) for v in s.scalars(select(CaseVersion).where(CaseVersion.case_id==id).order_by(CaseVersion.version.desc())).all()]
-@app.post('/api/cases')
-def create_case(b:CaseIn,s:Session=Depends(db),u:User=Depends(user)):
-    accessible(s,u,b.project_id);require_project_role(s,u,b.project_id,('admin','lead','tester'))
-    validate_custom_values(s,b.project_id,b.custom_values)
-    if b.priority not in ('Low','Medium','High','Critical') or b.kind not in ('Manual','Automated','Both') or b.status not in ('Active','Draft','Deprecated'): raise HTTPException(400,'Invalid test case metadata')
-    if b.folder_id: 
-        folder=obj(s,TestFolder,b.folder_id)
-        if folder.project_id!=b.project_id: raise HTTPException(400,'Folder belongs to another project')
-    x=TestCase(project_id=b.project_id,folder_id=b.folder_id,title=b.title,priority=b.priority,kind=b.kind,status=b.status,author_id=u.id,custom_values=b.custom_values);s.add(x);s.flush();s.add(CaseVersion(case_id=x.id,version=1,preconditions=b.preconditions,steps=b.steps,author_id=u.id));audit(s,u.id,'create','test_case',x.id,b.project_id,after=data(x));s.commit();return data(x)
-@app.put('/api/cases/{id}')
-def edit_case(id:int,b:CaseIn,s:Session=Depends(db),u:User=Depends(user)):
-    x=obj(s,TestCase,id);accessible(s,u,x.project_id);require_project_role(s,u,x.project_id,('admin','lead','tester'));before=data(x)
-    if b.project_id!=x.project_id: raise HTTPException(400,'Cannot move case across projects')
-    validate_custom_values(s,x.project_id,b.custom_values)
-    if b.priority not in ('Low','Medium','High','Critical') or b.kind not in ('Manual','Automated','Both') or b.status not in ('Active','Draft','Deprecated'): raise HTTPException(400,'Invalid test case metadata')
-    if b.folder_id:
-        folder=obj(s,TestFolder,b.folder_id)
-        if folder.project_id!=x.project_id: raise HTTPException(400,'Folder belongs to another project')
-    x.title=b.title;x.priority=b.priority;x.kind=b.kind;x.status=b.status;x.folder_id=b.folder_id;x.custom_values=b.custom_values;x.version+=1;x.updated_at=now();s.add(CaseVersion(case_id=id,version=x.version,preconditions=b.preconditions,steps=b.steps,author_id=u.id));audit(s,u.id,'update','test_case',id,x.project_id,before,data(x));s.commit();return data(x)
-@app.post('/api/cases/{id}/archive')
-def archive_case(id:int,s:Session=Depends(db),u:User=Depends(user)):
-    x=obj(s,TestCase,id);accessible(s,u,x.project_id);require_project_role(s,u,x.project_id,('admin','lead','tester'));x.archived=True;audit(s,u.id,'archive','test_case',id,x.project_id,after=data(x));s.commit();return {'ok':True}
-@app.post('/api/cases/{id}/restore')
-def restore_case(id:int,s:Session=Depends(db),u:User=Depends(user)):
-    x=obj(s,TestCase,id);accessible(s,u,x.project_id);require_project_role(s,u,x.project_id,('admin','lead','tester'));x.archived=False;audit(s,u.id,'restore','test_case',id,x.project_id,after=data(x));s.commit();return {'ok':True}
-@app.post('/api/cases/bulk-archive')
-def bulk_archive_cases(project_id:int,case_ids:list[int],s:Session=Depends(db),u:User=Depends(user)):
-    accessible(s,u,project_id);require_project_role(s,u,project_id,('admin','lead','tester'))
-    rows=s.scalars(select(TestCase).where(TestCase.project_id==project_id,TestCase.id.in_(case_ids))).all()
-    if len(rows)!=len(set(case_ids)): raise HTTPException(400,'One or more cases do not belong to this project')
-    for x in rows: x.archived=True;audit(s,u.id,'archive','test_case',x.id,project_id)
-    s.commit();return {'archived':len(rows)}
-@app.get('/api/folders')
-def folders(project_id:int,s:Session=Depends(db),u:User=Depends(user)):
-    accessible(s,u,project_id);return [data(x) for x in s.scalars(select(TestFolder).where(TestFolder.project_id==project_id).order_by(TestFolder.name)).all()]
-@app.post('/api/folders')
-def create_folder(project_id:int,name:str,parent_id:Optional[int]=None,s:Session=Depends(db),u:User=Depends(user)):
-    accessible(s,u,project_id);require_project_role(s,u,project_id,('admin','lead','tester'))
-    if parent_id and obj(s,TestFolder,parent_id).project_id!=project_id: raise HTTPException(400,'Parent folder belongs to another project')
-    if s.scalar(select(TestFolder).where(TestFolder.project_id==project_id,TestFolder.name==name)): raise HTTPException(409,'Folder name already exists')
-    x=TestFolder(project_id=project_id,parent_id=parent_id,name=name);s.add(x);s.flush();audit(s,u.id,'create','folder',x.id,project_id,after=data(x));s.commit();return data(x)
 @app.get('/api/custom-fields')
 def custom_fields(project_id:int,s:Session=Depends(db),u:User=Depends(user)):
     accessible(s,u,project_id);return [data(x) for x in s.scalars(select(CustomField).where(CustomField.project_id==project_id)).all()]
@@ -655,49 +555,6 @@ def get_attachment(id:int,s:Session=Depends(db),u:User=Depends(user)):
 def execution_attachments(id:int,s:Session=Depends(db),u:User=Depends(user)):
     e=obj(s,Execution,id);cc=obj(s,CycleCase,e.cycle_case_id);accessible(s,u,project_for_cycle(s,cc.cycle_id))
     return [data(x) for x in s.scalars(select(Attachment).where(Attachment.execution_id==id)).all()]
-@app.post('/api/cases/import.xlsx')
-async def import_cases_xlsx(project_id:int,file:UploadFile=File(...),s:Session=Depends(db),u:User=Depends(user)):
-    accessible(s,u,project_id);require_project_role(s,u,project_id,('admin','lead','tester'))
-    if not (file.filename or '').lower().endswith('.xlsx'): raise HTTPException(415,'Upload an .xlsx workbook')
-    raw=await file.read(5_000_001)
-    if len(raw)>5_000_000: raise HTTPException(413,'Workbook exceeds 5 MB')
-    try:
-        from openpyxl import load_workbook
-        workbook=load_workbook(io.BytesIO(raw),read_only=True,data_only=True)
-    except Exception as exc: raise HTTPException(400,'Invalid Excel workbook') from exc
-    sheet=workbook.active
-    rows=sheet.iter_rows(values_only=True)
-    headers=[str(v or '').strip().lower() for v in next(rows,())]
-    required={'title','priority','kind'}
-    if not required.issubset(headers): raise HTTPException(400,'Workbook needs title, priority and kind columns')
-    index={name:headers.index(name) for name in headers}
-    imported=0;errors=[]
-    for row_number,row in enumerate(rows,start=2):
-        title=str(row[index['title']] or '').strip() if index['title']<len(row) else ''
-        if not title:
-            errors.append({'row':row_number,'error':'Title is required'});continue
-        def cell(name,default=''):
-            i=index.get(name)
-            return str(row[i] if i is not None and i<len(row) and row[i] is not None else default)
-        try: steps=json.loads(cell('steps','[]'))
-        except json.JSONDecodeError:
-            errors.append({'row':row_number,'error':'Steps must contain JSON'});continue
-        if not isinstance(steps,list):
-            errors.append({'row':row_number,'error':'Steps must be a JSON array'});continue
-        case=TestCase(project_id=project_id,title=title[:300],priority=cell('priority','Medium'),kind=cell('kind','Manual'),status=cell('status','Active'),author_id=u.id)
-        s.add(case);s.flush();s.add(CaseVersion(case_id=case.id,version=1,preconditions=cell('preconditions'),steps=steps,author_id=u.id));imported+=1
-    audit(s,u.id,'import','test_cases',project_id,project_id,after={'filename':os.path.basename(file.filename or ''),'imported':imported,'errors':errors});s.commit();return {'imported':imported,'errors':errors}
-@app.get('/api/cases/export/xlsx')
-def export_cases_xlsx(project_id:int,s:Session=Depends(db),u:User=Depends(user)):
-    accessible(s,u,project_id)
-    from openpyxl import Workbook
-    workbook=Workbook();sheet=workbook.active;sheet.title='Test Cases'
-    sheet.append(['key','title','priority','kind','status','preconditions','steps','version'])
-    for c in s.scalars(select(TestCase).where(TestCase.project_id==project_id).order_by(TestCase.id)).all():
-        v=s.scalar(select(CaseVersion).where(CaseVersion.case_id==c.id,CaseVersion.version==c.version))
-        sheet.append([f'TC-{c.id}',c.title,c.priority,c.kind,c.status,v.preconditions if v else '',json.dumps(v.steps if v else []),c.version])
-    buf=io.BytesIO();workbook.save(buf);buf.seek(0)
-    return StreamingResponse(iter([buf.getvalue()]),media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',headers={'Content-Disposition':'attachment; filename="test-cases.xlsx"'})
 @app.get('/api/notifications')
 def notifications(s:Session=Depends(db),u:User=Depends(user)):
     return [data(x) for x in s.scalars(select(Notification).where(Notification.user_id==u.id).order_by(Notification.created_at.desc()).limit(100)).all()]
@@ -750,25 +607,8 @@ def audit_events(project_id:Optional[int]=None,limit:int=Query(100,ge=1,le=500),
         accessible(s,u,project_id);require_project_role(s,u,project_id,('admin','lead'));query=query.where(AuditEvent.project_id==project_id)
     elif not has_any_role(u,'admin'): raise HTTPException(403,'Admin required')
     return [data(x) for x in s.scalars(query).all()]
-@app.get('/api/dashboard')
-def dashboard(project_id:int,cycle_id:Optional[int]=None,release:Optional[str]=None,s:Session=Depends(db),u:User=Depends(user)):
-    accessible(s,u,project_id)
-    case_count=s.scalar(select(func.count()).select_from(TestCase).where(TestCase.project_id==project_id,TestCase.archived==False))
-    defects=s.scalars(select(Defect).where(Defect.project_id==project_id)).all()
-    cycle_query=select(Cycle.id).join(TestPlan).where(TestPlan.project_id==project_id)
-    if release is not None: cycle_query=cycle_query.where(TestPlan.release==release)
-    if cycle_id is not None:
-        if project_for_cycle(s,cycle_id)!=project_id: raise HTTPException(400,'Cycle belongs to another project')
-        cycle_query=cycle_query.where(Cycle.id==cycle_id)
-    cycle_ids=s.scalars(cycle_query).all()
-    entries=s.scalars(select(Execution).join(CycleCase).where(CycleCase.cycle_id.in_(cycle_ids))).all() if cycle_ids else []
-    cycle_items=s.scalars(select(CycleCase).where(CycleCase.cycle_id.in_(cycle_ids))).all() if cycle_ids else []
-    latest={item.id:s.scalar(select(Execution.status).where(Execution.cycle_case_id==item.id).order_by(Execution.id.desc()).limit(1)) for item in cycle_items}
-    statuses={k:sum(status==k for status in latest.values()) for k in ('Passed','Failed','Blocked','Skipped')}
-    statuses['Not Run']=sum(status is None for status in latest.values())
-    completed=sum(status is not None for status in latest.values())
-    recent=s.scalars(select(Execution).join(CycleCase).where(CycleCase.cycle_id.in_(cycle_ids)).order_by(Execution.created_at.desc()).limit(10)).all() if cycle_ids else []
-    return {'cases':case_count,'executions':len(entries),'statuses':statuses,'open_defects':sum(d.status!='Closed' for d in defects),'defects_by_severity':{k:sum(d.status!='Closed' and d.severity==k for d in defects) for k in ('Critical','High','Medium','Low')},'cycles':len(cycle_ids),'progress':(completed/len(cycle_items) if cycle_items else 0),'recent_activity':[data(e) for e in recent],'recent_defects':[data(d) for d in defects[-5:]]}
+app.include_router(create_dashboard_router(db, user, accessible, project_for_cycle))
+
 @app.get('/api/reports/executions.csv')
 def report(project_id:int,cycle_id:Optional[int]=None,s:Session=Depends(db),u:User=Depends(user)):
     accessible(s,u,project_id);buf=io.StringIO();w=csv.writer(buf);w.writerow(['execution_id','case_id','cycle_id','status','source','user_id','timestamp'])
@@ -788,3 +628,5 @@ def defect_report(project_id:int,s:Session=Depends(db),u:User=Depends(user)):
 def health(s:Session=Depends(db)):
     s.execute(select(1))
     return {'status':'ok','database':'ok','api_version':'v1'}
+
+app.include_router(create_test_cases_router(db, user, accessible, require_project_role, obj, data, audit, validate_custom_values))

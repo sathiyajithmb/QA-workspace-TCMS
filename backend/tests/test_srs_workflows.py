@@ -330,3 +330,224 @@ def test_scoped_ci_tokens_evidence_traceability_and_excel(client):
     parsed = load_workbook(io.BytesIO(exported.content), read_only=True, data_only=True)
     assert parsed.active.max_row == 3
     assert client.get(f"/api/audit?project_id={project['id']}").status_code == 200
+
+
+def test_public_registration_persists_tester_and_allows_login(client):
+    client.post('/api/auth/logout')
+    payload = {'name': ' New Tester ', 'email': 'NEW@example.test', 'password': 'new-tester-password-2026', 'roles': ['admin'], 'role': 'admin'}
+    response = client.post('/api/auth/register', json=payload)
+    assert response.status_code == 201, response.text
+    assert 'password_hash' not in response.json()
+    with main.SessionLocal() as session:
+        account = session.get(main.User, response.json()['id'])
+        assert account.email == 'new@example.test'
+        assert account.name == 'New Tester'
+        assert account.roles == ['tester']
+        assert account.role == 'tester'
+        assert account.password_hash != payload['password']
+        assert main.verify_password(payload['password'], account.password_hash)
+    assert client.post('/api/auth/register', json=payload).status_code == 409
+    assert client.post('/api/auth/login', json={'email': 'new@example.test', 'password': payload['password']}).status_code == 200
+    assert client.get('/api/me').json()['roles'] == ['tester']
+    assert client.get('/api/projects').json() == []
+    assert client.post('/api/users', json={'name': 'Other', 'email': 'other@example.test', 'password': 'another-password-2026'}).status_code == 403
+
+
+@pytest.mark.parametrize('changes,expected', [
+    ({'name': ''}, 422),
+    ({'name': '   '}, 400),
+    ({'email': 'not-an-email'}, 400),
+    ({'password': 'short'}, 422),
+])
+def test_public_registration_rejects_invalid_input(client, changes, expected):
+    client.post('/api/auth/logout')
+    payload = {'name': 'Tester', 'email': 'invalid@example.test', 'password': 'valid-password-2026'}
+    payload.update(changes)
+    assert client.post('/api/auth/register', json=payload).status_code == expected
+    with main.SessionLocal() as session:
+        assert session.scalar(main.select(main.func.count()).select_from(main.User)) == 1
+
+
+def test_dashboard_router_aliases_filters_and_permissions(client):
+    project = make_project(client)
+    case = make_case(client, project['id'])
+    for title, actual_result in (
+        ('Spreadsheet pass', 'PASS'),
+        ('Spreadsheet pass lowercase', ' pass '),
+        ('Spreadsheet fail', 'FAIL'),
+        ('Spreadsheet in progress', 'Pending'),
+        ('Spreadsheet skip', 'Skipped'),
+        ('Spreadsheet block', 'BLOCK'),
+        ('No recorded result', ''),
+    ):
+        response = client.post('/api/cases', json={
+            'project_id': project['id'],
+            'title': title,
+            'import_metadata': {'actual_result': actual_result},
+        })
+        assert response.status_code == 200, response.text
+    cycle, item = make_cycle(client, project, case)
+    path = f"/api/dashboard?project_id={project['id']}"
+    initial = client.get(path)
+    assert initial.status_code == 200
+    assert initial.json()['statuses']['Not Run'] == 1
+    assert initial.json()['case_statuses'] == {
+        'Pass': 2,
+        'Fail': 1,
+        'In Progress': 1,
+        'Skip': 1,
+        'Block': 1,
+    }
+    assert initial.json()['progress'] == 0
+    assert client.get(path.replace('/api/', '/api/v1/')).json() == initial.json()
+    for status in ('Failed', 'Passed'):
+        assert client.post(f"/api/cycle-cases/{item['id']}/executions", json={'status': status}).status_code == 200
+    result = client.get(path + f"&cycle_id={cycle['id']}&release=1.0").json()
+    assert result['executions'] == 2
+    assert result['statuses']['Passed'] == 1
+    assert result['progress'] == 1
+    assert client.get(path + '&release=missing').json()['cycles'] == 0
+    other = client.post('/api/projects', json={'key': 'OTHER', 'name': 'Other'}).json()
+    assert client.get(f"/api/dashboard?project_id={other['id']}&cycle_id={cycle['id']}").status_code == 400
+    client.post('/api/auth/logout')
+    assert client.get(path).status_code == 401
+    account = {'name': 'Dashboard outsider', 'email': 'dashboard-outsider@example.test', 'password': 'dashboard-password-2026'}
+    assert client.post('/api/auth/register', json=account).status_code == 201
+    assert client.post('/api/auth/login', json=account).status_code == 200
+    assert client.get(path).status_code == 403
+
+
+
+def test_case_excel_import_summary_and_display_data(client):
+    project = make_project(client)
+    book = Workbook()
+    sheet = book.active
+    sheet.append(['title', 'priority', 'kind', 'preconditions', 'steps'])
+    sheet.append(['Imported login', 'High', 'Manual', 'Logged out', '[{"action":"Open login","expected":"Page appears"}]'])
+    sheet.append(['', 'Low', 'Manual', '', '[]'])
+    sheet.append(['Invalid steps', 'Low', 'Manual', '', 'not json'])
+    sheet.append(['Invalid priority', 'Wrong', 'Manual', '', '[]'])
+    sheet.append(['Invalid step object', 'Low', 'Manual', '', '[1]'])
+    buffer = io.BytesIO()
+    book.save(buffer)
+    result = client.post(f"/api/v1/cases/import.xlsx?project_id={project['id']}", files={'file': ('cases.xlsx', buffer.getvalue())})
+    assert result.status_code == 200, result.text
+    summary = result.json()
+    assert summary['imported'] == 1
+    assert [row['row'] for row in summary['errors']] == [3, 4, 5, 6]
+    rows = client.get(f"/api/cases?project_id={project['id']}").json()
+    assert len(rows) == 1
+    assert rows[0]['id'] == summary['case_ids'][0]
+    assert rows[0]['title'] == 'Imported login'
+    details = client.get(f"/api/cases/{rows[0]['id']}").json()
+    assert details['preconditions'] == 'Logged out'
+    assert details['steps'][0]['expected'] == 'Page appears'
+    assert rows[0]['preconditions'] == details['preconditions']
+    assert rows[0]['steps'] == details['steps']
+    # A viewer can read the imported cases but cannot import more.
+    user = client.post('/api/users', json={'name':'Reader','email':'excel-reader@example.test','password':'excel-reader-password-2026'}).json()
+    client.post(f"/api/projects/{project['id']}/members", json={'user_id':user['id'],'role':'viewer'})
+    client.post('/api/auth/logout')
+    client.post('/api/auth/login', json={'email':'excel-reader@example.test','password':'excel-reader-password-2026'})
+    assert client.get(f"/api/cases?project_id={project['id']}").status_code == 200
+    assert client.post(f"/api/cases/import.xlsx?project_id={project['id']}", files={'file': ('cases.xlsx', buffer.getvalue())}).status_code == 403
+
+
+def test_case_list_is_ordered_oldest_first(client):
+    project = make_project(client)
+    created_ids = [make_case(client, project["id"])["id"] for _ in range(3)]
+
+    rows = client.get(f"/api/cases?project_id={project['id']}").json()
+
+    assert [row["id"] for row in rows] == created_ids
+
+
+def test_case_create_and_edit_store_spreadsheet_columns(client):
+    project = make_project(client)
+    payload = {
+        "project_id": project["id"],
+        "title": "Verify pipeline loads",
+        "priority": "High",
+        "kind": "Manual",
+        "status": "Active",
+        "preconditions": "Admin is logged in",
+        "steps": [{"action": "Open pipeline", "expected": "Pipeline is displayed"}],
+        "import_metadata": {
+            "feature": "Radiologist Pipeline",
+            "test_type": "UI/Functional",
+            "actual_result": "Pipeline displayed",
+            "sheet_status": "Passed",
+            "expected_result": "Pipeline is displayed",
+            "test_steps": "Open pipeline"
+        }
+    }
+
+    created = client.post("/api/cases", json=payload)
+    assert created.status_code == 200, created.text
+    case_id = created.json()["id"]
+    details = client.get(f"/api/cases/{case_id}").json()
+    assert details["import_metadata"] == payload["import_metadata"]
+
+    payload["import_metadata"]["actual_result"] = "Pipeline displayed without errors"
+    updated = client.put(f"/api/cases/{case_id}", json=payload)
+    assert updated.status_code == 200, updated.text
+    assert client.get(f"/api/cases/{case_id}").json()["import_metadata"] == payload["import_metadata"]
+
+
+
+def test_spreadsheet_columns_plain_steps_and_metadata_roundtrip(client):
+    project = make_project(client)
+    book = Workbook()
+    sheet = book.active
+    sheet.append(['-', 'Feature', 'Test Scenario', 'Preconditions', 'Test Steps', 'Expected Result', 'Priority', 'Test Type', 'Actual Result', 'Status'])
+    sheet.append(['RAD-TC-001', 'Radiologist Pipeline', 'Verify pipeline loads', 'Admin logged in', '1. Open pipeline.\n2. Observe cards.', 'Cards appear in correct stages.', 'critical', 'UI/Functional', 'PASS', 'Passed'])
+    sheet.append(['RAD-TC-002', 'Pipeline Count', 'Verify total count', 'Records exist', 'Observe total count.', 'Total matches cards.', 'High', 'Functional', '', ''])
+    buffer = io.BytesIO()
+    book.save(buffer)
+    imported = client.post(f"/api/cases/import.xlsx?project_id={project['id']}", files={'file': ('pipeline.xlsx', buffer.getvalue())})
+    assert imported.status_code == 200, imported.text
+    assert imported.json()['imported'] == 2
+    assert imported.json()['errors'] == []
+    case_id = imported.json()['case_ids'][0]
+    details = client.get(f'/api/cases/{case_id}').json()
+    assert details['title'] == 'Verify pipeline loads'
+    assert details['priority'] == 'Critical'
+    assert details['kind'] == 'Manual'
+    assert details['status'] == 'Active'
+    assert details['steps'] == [{'action':'Open pipeline.','expected':''}, {'action':'Observe cards.','expected':'Cards appear in correct stages.'}]
+    metadata = details['import_metadata']
+    assert metadata['source_id'] == 'RAD-TC-001'
+    assert metadata['test_type'] == 'UI/Functional'
+    assert metadata['actual_result'] == 'PASS'
+    assert metadata['sheet_status'] == 'Passed'
+    assert client.get(f"/api/dashboard?project_id={project['id']}").json()['executions'] == 0
+    updated = client.put(f'/api/cases/{case_id}', json={**details, 'title':'Updated title'})
+    assert updated.status_code == 200, updated.text
+    assert updated.json()['import_metadata'] == metadata
+    exported = client.get(f"/api/cases/export/xlsx?project_id={project['id']}")
+    other = client.post('/api/projects', json={'key':'ROUNDTRIP','name':'Roundtrip'}).json()
+    reimported = client.post(f"/api/cases/import.xlsx?project_id={other['id']}", files={'file': ('roundtrip.xlsx', exported.content)})
+    assert reimported.status_code == 200, reimported.text
+    assert reimported.json()['imported'] == 2
+    copy = client.get(f"/api/cases/{reimported.json()['case_ids'][0]}").json()
+    assert copy['import_metadata'] == metadata
+    assert copy['steps'] == details['steps']
+
+
+def test_import_metadata_migration_preserves_existing_rows(tmp_path):
+    from alembic import command
+    from alembic.config import Config
+    database_url = f"sqlite:///{tmp_path / 'before_metadata.db'}"
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.exec_driver_sql('CREATE TABLE test_cases (id INTEGER PRIMARY KEY, title TEXT)')
+        connection.exec_driver_sql("INSERT INTO test_cases VALUES (1, 'Existing case')")
+        connection.exec_driver_sql('CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)')
+        connection.exec_driver_sql("INSERT INTO alembic_version VALUES ('0001_srs_schema')")
+    config = Config('alembic.ini')
+    config.set_main_option('sqlalchemy.url', database_url)
+    command.upgrade(config, 'head')
+    with engine.connect() as connection:
+        row = connection.exec_driver_sql('SELECT title, import_metadata FROM test_cases WHERE id=1').one()
+        assert row == ('Existing case', '{}')
+    engine.dispose()
