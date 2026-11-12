@@ -1,0 +1,63 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-qamanager}
+      POSTGRES_USER: ${DB_USER:-qa}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      retries: 10
+  backend:
+    build: ./backend
+    env_file:
+      - path: ./local-runner.env
+        required: false
+    restart: unless-stopped
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-qamanager}
+      DB_USER: ${DB_USER:-qa}
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
+      UPLOAD_DIR: /app/uploads
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-10485760}
+      SESSION_HOURS: ${SESSION_HOURS:-8}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      BITBUCKET_EMAIL: ${BITBUCKET_EMAIL:-}
+      BITBUCKET_API_TOKEN: ${BITBUCKET_API_TOKEN:-}
+      QA_PUBLIC_URL: ${QA_PUBLIC_URL:-}
+      RESOURCE_SMTP_HOST: ${RESOURCE_SMTP_HOST:-}
+      RESOURCE_SMTP_PORT: ${RESOURCE_SMTP_PORT:-587}
+      RESOURCE_SMTP_USERNAME: ${RESOURCE_SMTP_USERNAME:-}
+      RESOURCE_SMTP_PASSWORD: ${RESOURCE_SMTP_PASSWORD:-}
+      RESOURCE_SMTP_FROM: ${RESOURCE_SMTP_FROM:-}
+      RESOURCE_REPORT_RECIPIENT: ${RESOURCE_REPORT_RECIPIENT:-kavaskar.docpanel@gmail.com}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - attachments:/app/uploads
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-8080}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+volumes:
+  pgdata:
+  attachments:
